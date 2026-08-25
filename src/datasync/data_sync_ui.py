@@ -40,6 +40,8 @@ available; a fake percentage would be worse than no percentage.
 
 import json
 import os
+import queue
+import threading
 import time
 import tkinter as tk
 from tkinter import font as tkfont
@@ -374,6 +376,14 @@ class MirrorWidget(tk.Tk):
         self.dock_corner = dock_corner
         self._drag = (0, 0)
 
+        # State for the off-thread "is this folder on S:?" check. The comparison
+        # walks both trees (S: is over the network), so it runs in a worker thread
+        # and hands the result back through this queue, drained on the UI thread.
+        self._check_q = queue.Queue()
+        self._checking = False
+        self._result_win = None
+        self._result_txt = None
+
         # NOT overrideredirect: that removes the taskbar button. Borderless is
         # achieved by clearing the frame styles instead, which keeps the button.
         self.title("Data backup status")
@@ -429,6 +439,9 @@ class MirrorWidget(tk.Tk):
         self.b_start = self._btn(btns, "start", self._start)
         self.b_stop = self._btn(btns, "stop", self._stop)
         self._btn(btns, "sync now", self._sync_now)
+        # Read-only spot check: pick a C: folder, see whether S: already has all
+        # of it. Distinct from "sync now" -- it copies nothing, it only compares.
+        self._btn(btns, "check S:", self._check_folder)
         self.msg = tk.Label(btns, text="", bg=BG, fg=ACCENT, font=mono)
         self.msg.pack(side="right")
 
@@ -521,6 +534,141 @@ class MirrorWidget(tk.Tk):
             self._flash("stopped %s" % (pid or "-"))
         except Exception as exc:
             self._flash(type(exc).__name__)
+
+    # -- "is this folder already on S:?" check -----------------------------
+    def _check_folder(self):
+        """Pick a C: folder and compare it, verbatim, against its S: mirror.
+
+        Read-only: it walks both trees and reports what S: is missing or has a
+        different-sized copy of -- it never copies anything (that is "sync now").
+        The walk runs in a worker thread so a large folder cannot freeze the
+        widget, and the result comes back through a queue drained on the UI thread
+        because tkinter may only be touched from the thread that created it.
+        """
+        from tkinter import filedialog, messagebox
+        try:
+            if self._checking:
+                self._flash("check running")
+                return
+            initial = dp.ROOT_C if os.path.isdir(dp.ROOT_C) else None
+            folder = filedialog.askdirectory(
+                parent=self, title="Pick a C: folder to check against S:",
+                initialdir=initial, mustexist=True)
+            if not folder:
+                return
+            folder = os.path.abspath(folder)
+            try:
+                mirror = dp.mirror_path(folder)     # C: path -> its S: counterpart
+            except Exception as exc:
+                messagebox.showerror(
+                    "Can't check this folder",
+                    "This folder can't be compared with S:.\n\n%s\n\nPick a "
+                    "folder under %s." % (exc, dp.ROOT_C))
+                return
+            self._checking = True
+            self._flash("checking S: ...")
+            self._open_result_window(folder, mirror)
+            threading.Thread(target=self._check_worker,
+                             args=(folder, mirror), daemon=True).start()
+            self.after(200, self._poll_check)
+        except Exception as exc:                     # a UI action must not crash
+            self._checking = False
+            self._flash(type(exc).__name__)
+
+    def _check_worker(self, c_root, s_root):
+        """Thread body: the two-tree comparison. Puts a plain dict on the queue.
+
+        Touches no widget -- everything it produces is handed to the UI thread via
+        the queue, which :meth:`_poll_check` drains.
+        """
+        payload = {"c_root": c_root, "s_root": s_root}
+        try:
+            import datasync.data_verify as dv
+            t0 = time.time()
+            payload["result"] = dv.compare_trees(c_root, s_root,
+                                                 tier=dv.DEFAULT_TIER)
+            payload["seconds"] = time.time() - t0
+        except Exception as exc:
+            payload["error"] = "%s: %s" % (type(exc).__name__, exc)
+        self._check_q.put(payload)
+
+    def _poll_check(self):
+        """UI-thread drain of the check queue -- the ONLY place a check result is
+        turned into widgets, so all tkinter access stays on the main thread."""
+        try:
+            payload = self._check_q.get_nowait()
+        except queue.Empty:
+            if self._checking:
+                self.after(200, self._poll_check)
+            return
+        self._checking = False
+        res = payload.get("result")
+        if res is None:
+            self._flash("check failed")
+        elif res["n_divergences"] == 0 and not res["n_walk_errors"]:
+            self._flash("S: has everything")
+        else:
+            self._flash("S: missing %d" % res["n_divergences"])
+        self._render_result(payload)
+
+    # -- result window -----------------------------------------------------
+    def _ensure_result_window(self):
+        """A single reused, scrollable, read-only report window. Recreated if the
+        user closed the previous one."""
+        win = self._result_win
+        if win is not None:
+            try:
+                if win.winfo_exists():
+                    win.deiconify()
+                    win.lift()
+                    return
+            except tk.TclError:
+                pass
+        win = tk.Toplevel(self)
+        win.title("Is this folder already on S:?")
+        win.configure(bg=BG)
+        txt = tk.Text(win, bg=BG, fg=FG, insertbackground=FG, wrap="none",
+                      width=94, height=30, borderwidth=0, highlightthickness=0,
+                      font=tkfont.Font(family="Consolas", size=9))
+        ys = tk.Scrollbar(win, orient="vertical", command=txt.yview)
+        xs = tk.Scrollbar(win, orient="horizontal", command=txt.xview)
+        txt.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        txt.grid(row=0, column=0, sticky="nsew")
+        ys.grid(row=0, column=1, sticky="ns")
+        xs.grid(row=1, column=0, sticky="ew")
+        win.rowconfigure(0, weight=1)
+        win.columnconfigure(0, weight=1)
+        self._result_win = win
+        self._result_txt = txt
+
+    def _set_result_text(self, text):
+        self._ensure_result_window()
+        txt = self._result_txt
+        txt.configure(state="normal")
+        txt.delete("1.0", "end")
+        txt.insert("1.0", text)
+        txt.configure(state="disabled")
+
+    def _open_result_window(self, c_root, s_root):
+        self._set_result_text(
+            "Comparing this folder on C: with S: -- please wait.\n\n"
+            "C:  %s\nS:  %s\n\nWalking both trees. S: is over the network, so a "
+            "large folder can take a little while; the widget stays live."
+            % (c_root, s_root))
+
+    def _render_result(self, payload):
+        if payload.get("result") is None:
+            self._set_result_text(
+                "The check could not run.\n\nC:  %s\nS:  %s\n\n%s"
+                % (payload["c_root"], payload["s_root"],
+                   payload.get("error", "unknown error")))
+            return
+        import datasync.data_verify as dv
+        text = dv.format_comparison(payload["c_root"], payload["s_root"],
+                                    payload["result"])
+        if payload.get("seconds") is not None:
+            text += "\n\n(checked in %.1f s)" % payload["seconds"]
+        self._set_result_text(text)
 
     # -- refresh -----------------------------------------------------------
     def _tick(self):
