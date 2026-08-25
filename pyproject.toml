@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "datasync"
+version = "0.1.0"
+description = "Additive C:->S: mirror daemon plus an independent two-source verifier, built on Windows robocopy."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Paul Varosy" }]
+keywords = ["robocopy", "backup", "mirror", "windows", "smb", "verification"]
+classifiers = [
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Topic :: System :: Archiving :: Backup",
+]
+# Core is stdlib-only. The two optional deps below are imported lazily and only
+# on the code paths that need them (a progress bar; the audit figure).
+dependencies = []
+
+[project.optional-dependencies]
+progress = ["tqdm"]      # live per-file progress bar (data_sync --progress)
+viz = ["matplotlib"]     # stacked-bar audit figure (data_verify --figure)
+test = ["pytest"]
+
+[project.scripts]
+datasync-sync = "datasync.data_sync:_cli"
+datasync-verify = "datasync.data_verify:_cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
