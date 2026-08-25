@@ -593,6 +593,107 @@ def format_receipt(rec):
     return "\n".join(lines)
 
 
+def _fmt_div_item(it):
+    """One divergence entry -> one readable line, whatever shape its bucket used.
+
+    The buckets are heterogeneous: ``missing_on_S`` / ``hash_mismatch`` hold plain
+    relative paths, ``size_mismatch`` holds ``{path, c_bytes, s_bytes}``, and
+    ``newer_on_C`` / ``unverifiable_window`` hold ``{path, c_mtime, s_mtime, ...}``.
+    """
+    if isinstance(it, str):
+        return it
+    if not isinstance(it, dict):
+        return str(it)
+    path = it.get("path", "?")
+    if "c_bytes" in it and "s_bytes" in it:
+        return "%s   (C: %d B, S: %d B)" % (path, it["c_bytes"], it["s_bytes"])
+    if "c_mtime" in it and "s_mtime" in it:
+        delta = "  (+%ss)" % it["delta_s"] if "delta_s" in it else ""
+        return "%s   (C: %s > S: %s%s)" % (path, it["c_mtime"], it["s_mtime"], delta)
+    return path
+
+
+def format_comparison(c_root, s_root, res, max_show=25):
+    """Plain-language answer to "does S: already have everything in this folder?".
+
+    Formats a :func:`compare_trees` result for the desktop widget's folder check.
+    Deliberately a spot-check view, not the delete-gating receipt: it reports
+    Source A (the Python walker) at the default 'size' tier, which is inventory +
+    byte size -- enough to answer "is it on S: and the same size", not enough to
+    authorise a delete (that is what ``--verify --tier full`` and the two-source
+    :func:`verify_week` are for).
+
+    Extras on S: are reported but never counted as the folder failing: as
+    everywhere in this module, S: legitimately keeps history C: has dropped.
+    """
+    a = res
+    n_div = a["n_divergences"]
+    clean = n_div == 0 and not a["n_walk_errors"]
+    if clean and a["n_extra_on_S"]:
+        head = ("S: HAS EVERYTHING in this folder.  (%d file(s) live only on S: "
+                "-- normal archived history.)" % a["n_extra_on_S"])
+    elif clean:
+        head = "S: HAS EVERYTHING in this folder -- the two match."
+    else:
+        head = ("NOT fully on S: -- %d file(s) on C: are missing from S: or "
+                "differ from the S: copy (details below)." % n_div)
+
+    lines = [head, "",
+             "C:  %s" % c_root,
+             "S:  %s" % s_root,
+             "check: inventory + byte size (tier=%s)" % a["tier"],
+             "",
+             "%-6s %12s %14s %10s" % ("", "files", "size", "dirs"),
+             "%-6s %12d %11.2f GB %10d"
+             % ("C:", a["c_n_files"], a["c_bytes"] / 1e9, a["c_n_dirs"]),
+             "%-6s %12d %11.2f GB %10d"
+             % ("S:", a["s_n_files"], a["s_bytes"] / 1e9, a["s_n_dirs"])]
+
+    # A C: folder with files whose S: side has none almost always means the share
+    # is not mounted / not mirrored yet, not that S: genuinely dropped everything.
+    if a["c_n_files"] and not a["s_n_files"]:
+        lines += ["",
+                  "  !! The S: side is EMPTY or unreadable. Is the S: drive "
+                  "mounted, and has this folder been mirrored yet?"]
+
+    div = a["divergences"]
+    buckets = (("missing from S:  (on C:, not on S:)", "missing_on_S",
+                a["n_missing_on_S"]),
+               ("different SIZE on S:", "size_mismatch", a["n_size_mismatch"]),
+               ("NEWER on C: than on S:", "newer_on_C", a["n_newer_on_C"]),
+               ("content differs (hash)", "hash_mismatch", a["n_hash_mismatch"]),
+               ("can't be settled without hashing", "unverifiable_window",
+                a.get("n_unverifiable_window", 0)))
+    for title, key, n in buckets:
+        if not n:
+            continue
+        items = div.get(key) or []
+        lines += ["", "%s: %d" % (title, n)]
+        for it in items[:max_show]:
+            lines.append("    %s" % _fmt_div_item(it))
+        shown = min(len(items), max_show)
+        if n > shown:
+            lines.append("    ... and %d more" % (n - shown))
+
+    if a["n_walk_errors"]:
+        lines += ["", "!! %d file(s)/dir(s) could NOT be read -- these are "
+                  "UNVERIFIED, so the folder can't be called complete:"
+                  % a["n_walk_errors"]]
+        for e in (a.get("walk_errors") or [])[:max_show]:
+            lines.append("    %s" % e)
+
+    if a["n_extra_on_S"]:
+        extra = a.get("extra_on_S") or []
+        lines += ["", "on S: only (archived history C: no longer has): %d"
+                  % a["n_extra_on_S"]]
+        for r in extra[:max_show]:
+            lines.append("    %s" % r)
+        shown = min(len(extra), max_show)
+        if a["n_extra_on_S"] > shown:
+            lines.append("    ... and %d more" % (a["n_extra_on_S"] - shown))
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Pruning eligibility -- the gate. Answers only "may this be deleted?"
 # ---------------------------------------------------------------------------
