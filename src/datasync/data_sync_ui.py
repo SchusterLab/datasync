@@ -391,6 +391,18 @@ class MirrorWidget(tk.Tk):
         self.attributes("-alpha", 0.94)
         self.configure(bg=BG)
         self.iconname("Backup")
+        # Custom window + taskbar icon. The taskbar button that
+        # make_borderless_but_taskbarred deliberately keeps would otherwise show
+        # the default Tk feather; `default=` also hands the same icon to the
+        # "check S:" result window. Defensive: a missing or blocked icon file must
+        # never stop the widget from coming up.
+        try:
+            _ico = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "backup.ico")
+            if os.path.isfile(_ico):
+                self.iconbitmap(default=_ico)
+        except Exception:
+            pass
 
         mono = tkfont.Font(family="Consolas", size=9)
         bold = tkfont.Font(family="Consolas", size=9, weight="bold")

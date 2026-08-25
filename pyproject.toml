@@ -29,5 +29,18 @@ test = ["pytest"]
 datasync-sync = "datasync.data_sync:_cli"
 datasync-verify = "datasync.data_verify:_cli"
 
+# GUI (not console) entry point: on Windows pip builds this with pythonw, so the
+# widget launches with NO console window -- the same thing the Data Backup.bat
+# does by hand. `pip install datasync` therefore already gives you a launcher
+# (`datasync-widget`) on PATH; the .bat is for a double-click / a machine where
+# the environment is not activated.
+[project.gui-scripts]
+datasync-widget = "datasync.data_sync_ui:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# Ship the widget's icon inside the installed package so data_sync_ui can find it
+# at runtime (it loads backup.ico from next to the module).
+[tool.setuptools.package-data]
+datasync = ["*.ico"]
