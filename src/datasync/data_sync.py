@@ -770,6 +770,49 @@ def active_paths(campaign=None, stale_s=None):
     return out
 
 
+def active_claims(campaign=None, stale_s=None):
+    """Structured view of the live claims, for a READ-ONLY consumer (the widget).
+
+    Sibling to :func:`active_paths`, but returns one record per marker --
+    ``{"path", "pid", "age", "stale_s"}`` -- instead of bare paths, and it
+    **never mutates**: no stale-marker deletion and no future-mtime re-stamp.
+    Those self-healing writes belong to the daemon's own passes through
+    ``active_paths``; a status widget polling every couple of seconds must not be
+    the thing that edits the daemon's state. The daemon still prunes stale
+    markers itself, so nothing is leaked by leaving them here.
+
+    Already-stale markers (age > stale) are omitted, so the caller sees exactly
+    the set the mirror is currently honouring. A marker with a FUTURE mtime is
+    reported as age 0.0 (the daemon honours and re-stamps it on its next pass).
+    ``pid`` is 0 when the marker predates pid recording or is unreadable. Sorted
+    freshest first.
+    """
+    stale = ACTIVE_STALE_S if stale_s is None else stale_s
+    out = []
+    d = _active_dir(campaign)
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return out
+    for n in names:
+        if not n.endswith(".active"):
+            continue
+        p = os.path.join(d, n)
+        age = _age(p)
+        if age is None:
+            continue
+        if age < 0:
+            age = 0.0                       # future mtime -- daemon re-stamps it
+        if age > stale:
+            continue                        # daemon will prune it; do not show
+        claimed, pid = _read_marker(p)
+        if not claimed:
+            continue
+        out.append({"path": claimed, "pid": pid, "age": age, "stale_s": stale})
+    out.sort(key=lambda r: r["age"])
+    return out
+
+
 def _run_glob(abs_path):
     """``<PREFIX>_<index>_*`` for a run path, else None.
 

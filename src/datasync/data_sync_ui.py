@@ -116,13 +116,20 @@ def _fmt_age(sec):
     return "%.1f days" % (sec / 86400)
 
 
-def running_process_names():
-    """Lowercased exe names of running processes, via Toolhelp32.
+def _process_snapshot():
+    """``{pid: lowercased exe name}`` for every running process, via Toolhelp32.
 
     ctypes rather than a subprocess: shelling out to tasklist every POLL_MS would
     spawn a process (and, from a console-less parent, a console WINDOW) on every
     tick -- the exact annoyance this widget exists to replace.
+
+    One walk serves BOTH the robocopy-count and the per-claim liveness check, so
+    it runs once per poll. Membership in this dict is a NON-KILLING liveness
+    probe for a claim's owner PID; deliberately not ``os.kill(pid, 0)``, because
+    on Windows os.kill calls TerminateProcess for any signal and would kill the
+    running experiment the claim is protecting.
     """
+    procs = {}
     try:
         import ctypes
         from ctypes import wintypes
@@ -146,22 +153,27 @@ def running_process_names():
         k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
         snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
         if snap == wintypes.HANDLE(-1).value:
-            return set()
+            return procs
         try:
             e = PROCESSENTRY32()
             e.dwSize = ctypes.sizeof(PROCESSENTRY32)
-            names = set()
             if not k32.Process32First(snap, ctypes.byref(e)):
-                return names
+                return procs
             while True:
-                names.add(e.szExeFile.decode("mbcs", "replace").lower())
+                procs[int(e.th32ProcessID)] = \
+                    e.szExeFile.decode("mbcs", "replace").lower()
                 if not k32.Process32Next(snap, ctypes.byref(e)):
                     break
-            return names
+            return procs
         finally:
             k32.CloseHandle(snap)
     except Exception:
-        return set()
+        return procs
+
+
+def running_process_names():
+    """Lowercased exe names of running processes (see :func:`_process_snapshot`)."""
+    return set(_process_snapshot().values())
 
 
 def work_area():
@@ -301,15 +313,37 @@ def snapshot(campaign=None):
         except Exception:
             snap["pid"] = None
         snap["pending"] = os.path.exists(os.path.join(sync, "sync_now"))
+
+        # One process walk serves both the robocopy count and per-claim liveness.
+        procs = _process_snapshot()
+        snap["n_robocopy"] = sum(1 for nm in procs.values()
+                                 if nm == "robocopy.exe")
+        snap["copying"] = snap["n_robocopy"] > 0
+
+        # Every current claim, with the facts the panel reports as STATUS: how
+        # long since it last wrote (age), whether its owner process still exists,
+        # and how long until the daemon auto-releases it. Deliberately NO
+        # live/stale verdict -- a live run whose points are ~20 min apart and a
+        # finished run whose kernel is still open look identical by age, so any
+        # such verdict would be a guess. The reader knows their own scan cadence.
         try:
-            snap["claims"] = [os.path.basename(p.rstrip("\\/"))
-                              for p in ds.active_paths(campaign)]
+            claims = []
+            for rec in ds.active_claims(campaign):
+                alive = (rec["pid"] in procs) if rec["pid"] else None
+                claims.append({
+                    "name": os.path.basename(rec["path"].rstrip("\\/")),
+                    "path": rec["path"],
+                    "pid": rec["pid"],
+                    "age": rec["age"],
+                    "clears_in": max(0.0, rec["stale_s"] - rec["age"]),
+                    "alive": alive,
+                })
+            # Freshest first: the run that wrote most recently sits on top; one
+            # that wrote long ago is further down and visibly ageing out.
+            claims.sort(key=lambda c: c["age"])
+            snap["claims"] = claims
         except Exception:
             snap["claims"] = []
-
-        snap["n_robocopy"] = sum(1 for n in running_process_names()
-                                 if n == "robocopy.exe")
-        snap["copying"] = snap["n_robocopy"] > 0
 
         # Prefer last_pass.json: it is the daemon's OWN per-target totals for the
         # whole sweep. sync.log cannot give that -- it is appended once per target,
@@ -407,6 +441,7 @@ class MirrorWidget(tk.Tk):
         mono = tkfont.Font(family="Consolas", size=9)
         bold = tkfont.Font(family="Consolas", size=9, weight="bold")
         title = tkfont.Font(family="Segoe UI", size=9, weight="bold")
+        self.mono = mono            # _render rebuilds the per-claim rows with it
 
         card = tk.Frame(self, bg=BG, highlightthickness=1,
                         highlightbackground="#2b3240")
@@ -439,6 +474,13 @@ class MirrorWidget(tk.Tk):
 
         self.rows = {}
         for key in ("state", "last", "claims", "disk"):
+            if key == "claims":
+                # A container, not a Label: _render_claims fills it with one Label
+                # per held run, each with its own fg (a single Label cannot).
+                fr = tk.Frame(card, bg=BG)
+                fr.pack(fill="x", padx=8, pady=(2, 0))
+                self.rows[key] = fr
+                continue
             lbl = tk.Label(card, text="", bg=BG, fg=FG, font=mono,
                            anchor="w", justify="left", wraplength=300)
             lbl.pack(fill="x", padx=8, pady=(2, 0))
@@ -706,7 +748,8 @@ class MirrorWidget(tk.Tk):
         if s["state"] == "no campaign":
             self.rows["state"].configure(
                 text="no campaign set - run the notebook startup cell", fg=WARN)
-            for k in ("last", "claims", "disk"):
+            self._render_claims([])          # a Frame has no "text" to blank
+            for k in ("last", "disk"):
                 self.rows[k].configure(text="")
             return
 
@@ -734,19 +777,61 @@ class MirrorWidget(tk.Tk):
             fg=BAD if (s["failed"] or 0) or s["any_failed"]
             else (WARN if s["partial"] else DIM))
 
-        if s["claims"]:
-            self.rows["claims"].configure(
-                text=("waiting for the experiment to finish:\n  "
-                      + "\n  ".join(s["claims"][:3])),
-                fg=WARN)
-        else:
-            self.rows["claims"].configure(
-                text="no experiment is writing right now", fg=DIM)
+        self._render_claims(s["claims"])
 
         if s["free_gb"] is not None:
             self.rows["disk"].configure(
                 text="C: %.0f GB free of %.0f" % (s["free_gb"], s["total_gb"]),
                 fg=BAD if s["free_gb"] < 100 else DIM)
+
+    def _render_claims(self, claims):
+        """Rebuild the claims block: a header plus one STATUS line per held run.
+
+        Reports plain facts, deliberately NO live/stale verdict -- a live run whose
+        points are ~20 min apart and a finished run whose kernel is still open are
+        indistinguishable by the marker alone, so any such verdict would be a
+        guess. Each line states how long ago the run last wrote, whether its owner
+        process still exists, and when the daemon will auto-release it if it stays
+        quiet. The reader knows their own scan cadence and judges the rest.
+
+        Safe regardless of write cadence: the .h5 is CLAIMED right before every
+        write (save_data / save_config -> mark_active) and is CLOSED between
+        writes, so the mirror only ever copies a file that is not being written --
+        a long gap between writes just lets the marker expire and the closed file
+        back up, and the next write re-claims it. See
+        CoreLib/ExperimentZCU111.save_data.
+
+        Rebuilt each poll (a few short Labels, cheap at POLL_MS). Every claim is
+        shown -- no truncation -- freshest first.
+        """
+        fr = self.rows["claims"]
+        for w in fr.winfo_children():
+            w.destroy()
+        if not claims:
+            tk.Label(fr, text="no run is holding the mirror right now",
+                     bg=BG, fg=DIM, font=self.mono, anchor="w",
+                     justify="left", wraplength=300).pack(fill="x")
+            return
+        n = len(claims)
+        tk.Label(fr, text="holding %d run%s - mirror is skipping these:"
+                          % (n, "" if n == 1 else "s"),
+                 bg=BG, fg=DIM, font=self.mono, anchor="w",
+                 justify="left", wraplength=300).pack(fill="x")
+        for c in claims:
+            if c["alive"] is True:
+                owner = "owner running"
+            elif c["alive"] is False:
+                owner = "owner gone"
+            else:
+                owner = "owner unknown"
+            status = "wrote %s ago · %s · clears in %s" % (
+                _fmt_age(c["age"]), owner, _fmt_age(c["clears_in"]))
+            # owner gone == this run's process no longer exists, so it is just
+            # ageing out to release; grey it. No live/stale colour verdict.
+            fg = FG if c["alive"] is True else DIM
+            tk.Label(fr, text="  %s\n     %s" % (c["name"], status),
+                     bg=BG, fg=fg, font=self.mono, anchor="w",
+                     justify="left", wraplength=292).pack(fill="x")
 
 
 def main(argv=None):
