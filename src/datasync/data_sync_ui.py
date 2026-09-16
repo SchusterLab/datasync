@@ -591,56 +591,176 @@ class MirrorWidget(tk.Tk):
 
     # -- "is this folder already on S:?" check -----------------------------
     def _check_folder(self):
-        """Pick a C: folder and compare it, verbatim, against its S: mirror.
+        """Pick one or more C: folders and compare each, verbatim, against S:.
 
         Read-only: it walks both trees and reports what S: is missing or has a
         different-sized copy of -- it never copies anything (that is "sync now").
-        The walk runs in a worker thread so a large folder cannot freeze the
-        widget, and the result comes back through a queue drained on the UI thread
+        Each comparison runs in a worker thread so a large folder cannot freeze
+        the widget, and results come back through a queue drained on the UI thread
         because tkinter may only be touched from the thread that created it.
         """
-        from tkinter import filedialog, messagebox
+        from tkinter import messagebox
         try:
             if self._checking:
                 self._flash("check running")
                 return
-            initial = dp.ROOT_C if os.path.isdir(dp.ROOT_C) else None
-            folder = filedialog.askdirectory(
-                parent=self, title="Pick a C: folder to check against S:",
-                initialdir=initial, mustexist=True)
-            if not folder:
+            folders = self._pick_folders()
+            if not folders:
                 return
-            folder = os.path.abspath(folder)
-            try:
-                mirror = dp.mirror_path(folder)     # C: path -> its S: counterpart
-            except Exception as exc:
+            pairs, bad = [], []
+            for folder in folders:
+                folder = os.path.abspath(folder)
+                try:
+                    pairs.append((folder, dp.mirror_path(folder)))
+                except Exception as exc:
+                    bad.append((folder, str(exc)))
+            if not pairs:
                 messagebox.showerror(
-                    "Can't check this folder",
-                    "This folder can't be compared with S:.\n\n%s\n\nPick a "
-                    "folder under %s." % (exc, dp.ROOT_C))
+                    "Can't check these folders",
+                    "None of the selected folders are under %s, so none can be "
+                    "compared with S::\n\n%s" % (dp.ROOT_C,
+                                                 "\n".join(f for f, _ in bad)))
                 return
+            if bad:
+                messagebox.showwarning(
+                    "Some folders skipped",
+                    "These are not under %s and were skipped:\n\n%s"
+                    % (dp.ROOT_C, "\n".join(f for f, _ in bad)))
             self._checking = True
-            self._flash("checking S: ...")
-            self._open_result_window(folder, mirror)
+            self._flash("checking %d folder(s) ..." % len(pairs))
+            self._open_result_window(pairs)
             threading.Thread(target=self._check_worker,
-                             args=(folder, mirror), daemon=True).start()
+                             args=(pairs,), daemon=True).start()
             self.after(200, self._poll_check)
         except Exception as exc:                     # a UI action must not crash
             self._checking = False
             self._flash(type(exc).__name__)
 
-    def _check_worker(self, c_root, s_root):
-        """Thread body: the two-tree comparison. Puts a plain dict on the queue.
+    def _pick_folders(self):
+        """Modal multi-select picker; returns a list of absolute C: folder paths.
+
+        tkinter has NO native multi-FOLDER dialog (askdirectory is single-only,
+        askopenfilenames is files-only), so this is a small
+        ``Listbox(selectmode="extended")`` over the subfolders of a parent
+        directory: Ctrl/Shift-click to select several, double-click to descend,
+        'up' / 'browse...' to move the parent. Defaults to the campaign's data
+        root, whose children are the week folders. Returns [] on cancel.
+        """
+        from tkinter import filedialog
+        try:
+            start = dp.campaign_data_root("C", self.campaign)
+        except Exception:
+            start = dp.ROOT_C
+        if not os.path.isdir(start):
+            start = dp.ROOT_C if os.path.isdir(dp.ROOT_C) else os.path.expanduser("~")
+        state = {"parent": os.path.abspath(start), "names": [], "picked": []}
+
+        win = tk.Toplevel(self)
+        win.title("Pick C: folders to check against S:")
+        win.configure(bg=BG)
+        win.transient(self)
+
+        top = tk.Frame(win, bg=BG)
+        top.pack(fill="x", padx=8, pady=(8, 2))
+        tk.Label(top, text="in:", bg=BG, fg=DIM, font=self.mono).pack(side="left")
+        parent_lbl = tk.Label(top, text="", bg=BG, fg=FG, font=self.mono,
+                              anchor="w")
+        parent_lbl.pack(side="left", fill="x", expand=True, padx=(4, 0))
+
+        body = tk.Frame(win, bg=BG)
+        body.pack(fill="both", expand=True, padx=8, pady=4)
+        lb = tk.Listbox(body, selectmode="extended", bg="#0f131a", fg=FG,
+                        selectbackground=ACCENT, selectforeground=FG,
+                        activestyle="none", highlightthickness=0, borderwidth=0,
+                        width=76, height=16,
+                        font=tkfont.Font(family="Consolas", size=9))
+        ys = tk.Scrollbar(body, orient="vertical", command=lb.yview)
+        lb.configure(yscrollcommand=ys.set)
+        lb.pack(side="left", fill="both", expand=True)
+        ys.pack(side="left", fill="y")
+
+        def repopulate():
+            parent_lbl.configure(text=state["parent"])
+            lb.delete(0, "end")
+            try:
+                names = sorted(
+                    n for n in os.listdir(state["parent"])
+                    if os.path.isdir(os.path.join(state["parent"], n)))
+            except OSError:
+                names = []
+            state["names"] = names
+            for n in names:
+                lb.insert("end", n)
+            if not names:
+                lb.insert("end", "(no subfolders here -- use 'up' or 'browse...')")
+
+        def descend(_evt=None):
+            cur = lb.curselection()
+            if len(cur) != 1 or not state["names"]:
+                return
+            state["parent"] = os.path.join(state["parent"], state["names"][cur[0]])
+            repopulate()
+
+        def go_up():
+            up = os.path.dirname(state["parent"].rstrip("\\/"))
+            if up and up != state["parent"]:
+                state["parent"] = up
+                repopulate()
+
+        def browse():
+            d = filedialog.askdirectory(parent=win, title="Pick a parent folder",
+                                        initialdir=state["parent"], mustexist=True)
+            if d:
+                state["parent"] = os.path.abspath(d)
+                repopulate()
+
+        def confirm():
+            if state["names"]:
+                state["picked"] = [os.path.join(state["parent"], state["names"][i])
+                                   for i in lb.curselection()]
+            win.destroy()
+
+        def cancel():
+            state["picked"] = []
+            win.destroy()
+
+        lb.bind("<Double-Button-1>", descend)
+
+        btns = tk.Frame(win, bg=BG)
+        btns.pack(fill="x", padx=8, pady=(2, 8))
+        self._btn(btns, "up", go_up)
+        self._btn(btns, "browse...", browse)
+        self._btn(btns, "check selected", confirm)
+        self._btn(btns, "cancel", cancel)
+        tk.Label(btns, text="Ctrl/Shift-click = several · double-click = open",
+                 bg=BG, fg=DIM,
+                 font=tkfont.Font(family="Consolas", size=8)).pack(side="right")
+
+        repopulate()
+        win.update_idletasks()
+        win.grab_set()
+        self.wait_window(win)
+        return [os.path.abspath(p) for p in state["picked"]]
+
+    def _check_worker(self, pairs):
+        """Thread body: compare each (C:, S:) pair. Puts a plain dict on the queue.
 
         Touches no widget -- everything it produces is handed to the UI thread via
-        the queue, which :meth:`_poll_check` drains.
+        the queue, which :meth:`_poll_check` drains. A folder that errors becomes
+        one failed entry in the result list; it does not abort the others.
         """
-        payload = {"c_root": c_root, "s_root": s_root}
+        payload = {"pairs": pairs, "results": []}
         try:
             import datasync.data_verify as dv
             t0 = time.time()
-            payload["result"] = dv.compare_trees(c_root, s_root,
-                                                 tier=dv.DEFAULT_TIER)
+            for c_root, s_root in pairs:
+                item = {"c_root": c_root, "s_root": s_root}
+                try:
+                    item["result"] = dv.compare_trees(c_root, s_root,
+                                                       tier=dv.DEFAULT_TIER)
+                except Exception as exc:
+                    item["error"] = "%s: %s" % (type(exc).__name__, exc)
+                payload["results"].append(item)
             payload["seconds"] = time.time() - t0
         except Exception as exc:
             payload["error"] = "%s: %s" % (type(exc).__name__, exc)
@@ -656,13 +776,19 @@ class MirrorWidget(tk.Tk):
                 self.after(200, self._poll_check)
             return
         self._checking = False
-        res = payload.get("result")
-        if res is None:
+        results = payload.get("results") or []
+        ok = [r for r in results if r.get("result") is not None]
+        n_failed = len(results) - len(ok)
+        total_div = sum(r["result"]["n_divergences"] for r in ok)
+        total_walkerr = sum(r["result"]["n_walk_errors"] for r in ok)
+        if payload.get("error") or not results:
             self._flash("check failed")
-        elif res["n_divergences"] == 0 and not res["n_walk_errors"]:
+        elif n_failed:
+            self._flash("%d folder(s) failed" % n_failed)
+        elif total_div == 0 and not total_walkerr:
             self._flash("S: has everything")
         else:
-            self._flash("S: missing %d" % res["n_divergences"])
+            self._flash("S: missing %d" % total_div)
         self._render_result(payload)
 
     # -- result window -----------------------------------------------------
@@ -703,26 +829,41 @@ class MirrorWidget(tk.Tk):
         txt.insert("1.0", text)
         txt.configure(state="disabled")
 
-    def _open_result_window(self, c_root, s_root):
+    def _open_result_window(self, pairs):
+        lst = "\n".join("  C:  %s\n  S:  %s" % (c, s) for c, s in pairs)
         self._set_result_text(
-            "Comparing this folder on C: with S: -- please wait.\n\n"
-            "C:  %s\nS:  %s\n\nWalking both trees. S: is over the network, so a "
-            "large folder can take a little while; the widget stays live."
-            % (c_root, s_root))
+            "Comparing %d folder(s) on C: with S: -- please wait.\n\n%s\n\n"
+            "Walking both trees. S: is over the network, so a large folder can "
+            "take a little while; the widget stays live." % (len(pairs), lst))
 
     def _render_result(self, payload):
-        if payload.get("result") is None:
-            self._set_result_text(
-                "The check could not run.\n\nC:  %s\nS:  %s\n\n%s"
-                % (payload["c_root"], payload["s_root"],
-                   payload.get("error", "unknown error")))
+        if payload.get("error") and not payload.get("results"):
+            self._set_result_text("The check could not run.\n\n%s"
+                                  % payload["error"])
             return
         import datasync.data_verify as dv
-        text = dv.format_comparison(payload["c_root"], payload["s_root"],
-                                    payload["result"])
+        results = payload.get("results") or []
+        ok = [r for r in results if r.get("result") is not None]
+        n_failed = len(results) - len(ok)
+        total_div = sum(r["result"]["n_divergences"] for r in ok)
+        head = ["Checked %d folder(s) on C: against S:." % len(results)]
+        if ok:
+            head.append("Missing/different on S: %d total." % total_div)
+        if n_failed:
+            head.append("%d could not be checked." % n_failed)
         if payload.get("seconds") is not None:
-            text += "\n\n(checked in %.1f s)" % payload["seconds"]
-        self._set_result_text(text)
+            head.append("(%.1f s)" % payload["seconds"])
+        parts = ["  ".join(head), "=" * 78]
+        for r in results:
+            if r.get("result") is None:
+                parts.append("C:  %s\nS:  %s\n  COULD NOT CHECK: %s"
+                             % (r["c_root"], r["s_root"],
+                                r.get("error", "unknown error")))
+            else:
+                parts.append(dv.format_comparison(r["c_root"], r["s_root"],
+                                                  r["result"]))
+            parts.append("-" * 78)
+        self._set_result_text("\n\n".join(parts))
 
     # -- refresh -----------------------------------------------------------
     def _tick(self):
