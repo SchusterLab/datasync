@@ -34,6 +34,8 @@ import collections
 import datetime
 import hashlib
 import json
+import logging
+import math
 import os
 import re
 import shutil
@@ -557,8 +559,53 @@ ACTIVE_SUBDIR = "active"
 
 # A marker not refreshed for this long is ignored and deleted, so a run that dies
 # without clearing its marker cannot keep its folder off the mirror for ever.
-# Raise it if an experiment can go longer than this between writes.
+# Default when the campaign has no saved timeout. The widget can override it.
 ACTIVE_STALE_S = 900.0
+
+
+def _active_timeout_seconds(value):
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Active timeout must be positive, finite seconds.") from exc
+    if isinstance(value, bool) or not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("Active timeout must be positive, finite seconds.")
+    return seconds
+
+
+def get_active_stale_s(campaign=None):
+    """Saved active-marker timeout in seconds, or ``ACTIVE_STALE_S``.
+
+    Read on every call so separate processes see edits without restarting.
+    """
+    try:
+        with open(_state("settings.json", campaign), encoding="utf-8") as fid:
+            settings = json.load(fid)
+        if not isinstance(settings, dict):
+            raise ValueError("Expected a settings object.")
+        return _active_timeout_seconds(settings.get("active_stale_s", ACTIVE_STALE_S))
+    except FileNotFoundError:
+        return ACTIVE_STALE_S
+    except (OSError, ValueError) as exc:
+        logging.getLogger(__name__).warning(
+            "Cannot read active timeout for %s; using %g seconds: %s",
+            campaign or "active campaign", ACTIVE_STALE_S, exc)
+        return ACTIVE_STALE_S
+
+
+def set_active_stale_s(seconds, campaign=None):
+    """Atomically save a positive, finite timeout for this campaign, in seconds.
+
+    Existing markers use it on their next evaluation. Raises on invalid input
+    or a failed save; the previous setting remains intact.
+    """
+    seconds = _active_timeout_seconds(seconds)
+    path = _state("settings.json", campaign, create=True)
+    tmp = path + ".tmp%d" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as fid:
+        json.dump({"active_stale_s": seconds}, fid, indent=1, allow_nan=False)
+    os.replace(tmp, path)
+    return seconds
 
 
 def _active_dir(campaign=None, create=False):
@@ -720,7 +767,7 @@ def active_paths(campaign=None, stale_s=None):
     Stale markers are both ignored and removed here, so the set self-heals after
     a crashed run with no separate cleanup step.
     """
-    stale = ACTIVE_STALE_S if stale_s is None else stale_s
+    stale = get_active_stale_s(campaign) if stale_s is None else stale_s
     out = []
     try:
         names = sorted(os.listdir(_active_dir(campaign)))
@@ -744,7 +791,7 @@ def active_paths(campaign=None, stale_s=None):
             # the claim permanently fresh instead of permanently negative.
             #
             # Re-stamp the marker to now instead: the claim stays live for one
-            # normal ACTIVE_STALE_S window (so a genuinely running experiment
+            # configured timeout window (so a genuinely running experiment
             # keeps its protection and the crash window does not reopen), and
             # then expires like any other. Self-healing, and it cannot pin.
             print("[sync] marker %s has a FUTURE mtime (%.0f s ahead) -- "
@@ -787,7 +834,7 @@ def active_claims(campaign=None, stale_s=None):
     ``pid`` is 0 when the marker predates pid recording or is unreadable. Sorted
     freshest first.
     """
-    stale = ACTIVE_STALE_S if stale_s is None else stale_s
+    stale = get_active_stale_s(campaign) if stale_s is None else stale_s
     out = []
     d = _active_dir(campaign)
     try:

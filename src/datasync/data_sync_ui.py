@@ -6,13 +6,12 @@ A small frameless card that floats above other windows, drag it anywhere. Shows
 whether the daemon is alive, whether a copy is in flight, what the last pass did,
 and which run folders the mirror is currently avoiding.
 
-Why a pure READER
------------------
-It touches nothing the daemon owns. Every value comes from state the daemon
-already publishes -- the heartbeat mtime, daemon.lock, sync_now, the active/
-markers, sync.log -- plus a process-list check for a live robocopy. There is no
-IPC, no shared memory and no daemon-side change, so the widget cannot desync from
-the daemon, cannot crash it, and can be started or killed at any time.
+Status reads and explicit controls
+---------------------------------
+Polling reads the daemon's heartbeat, lock, trigger, active markers, and logs,
+plus a process-list check for a live robocopy. It never changes active markers.
+Explicit buttons start/stop the daemon, request a copy, compare folders, or save
+the campaign's active-run timeout. Settings are shared through an atomic file.
 
 Two properties were verified before writing this, because getting either wrong
 would make the widget actively harmful:
@@ -290,7 +289,8 @@ def snapshot(campaign=None):
             "copying": False, "n_robocopy": 0, "pass_age": None,
             "copied": None, "skipped": None, "failed": None, "ended": None,
             "free_gb": None, "total_gb": None, "source": None, "targets": [],
-            "any_failed": False, "pass_seconds": None, "partial": False}
+            "any_failed": False, "pass_seconds": None, "partial": False,
+            "active_stale_s": None}
     try:
         snap["campaign"] = dp.active_campaign(campaign)
     except Exception as exc:
@@ -304,6 +304,7 @@ def snapshot(campaign=None):
         import datasync.data_sync as ds
         sync = dp.sync_dir("C", campaign)
         stale_s = ds.HEARTBEAT_STALE_S * STALE_MULT
+        snap["active_stale_s"] = ds.get_active_stale_s(campaign)
 
         snap["hb_age"] = _age(os.path.join(sync, "heartbeat"))
         snap["alive"] = snap["hb_age"] is not None and snap["hb_age"] < stale_s
@@ -328,7 +329,7 @@ def snapshot(campaign=None):
         # such verdict would be a guess. The reader knows their own scan cadence.
         try:
             claims = []
-            for rec in ds.active_claims(campaign):
+            for rec in ds.active_claims(campaign, stale_s=snap["active_stale_s"]):
                 alive = (rec["pid"] in procs) if rec["pid"] else None
                 claims.append({
                     "name": os.path.basename(rec["path"].rstrip("\\/")),
@@ -486,6 +487,22 @@ class MirrorWidget(tk.Tk):
             lbl.pack(fill="x", padx=8, pady=(2, 0))
             self.rows[key] = lbl
 
+        hold = tk.Frame(card, bg=BG)
+        hold.pack(fill="x", padx=8, pady=(6, 0))
+        tk.Label(hold, text="Hold after last write (min)", bg=BG, fg=DIM,
+                 font=mono).pack(side="left")
+        self.timeout_var = tk.StringVar()
+        self._timeout_campaign = None
+        self._timeout_saved_s = None
+        self.timeout_entry = tk.Entry(
+            hold, textvariable=self.timeout_var, width=6, bg="#232a35", fg=FG,
+            insertbackground=FG, font=mono, relief="flat")
+        self.timeout_entry.pack(side="left", padx=6)
+        self.timeout_entry.bind("<Return>", lambda e: self._apply_active_timeout())
+        self._btn(hold, "Apply", self._apply_active_timeout)
+        tk.Label(card, text="Shorter holds allow copying sooner.", bg=BG, fg=DIM,
+                 font=mono, anchor="w").pack(fill="x", padx=8)
+
         btns = tk.Frame(card, bg=BG)
         btns.pack(fill="x", padx=8, pady=(6, 7))
         # The widget owns the daemon's lifecycle now, so it needs BOTH directions.
@@ -551,6 +568,19 @@ class MirrorWidget(tk.Tk):
             self._flash("triggered" if ds.sync_now(self.campaign) else "failed")
         except Exception as exc:
             self._flash(type(exc).__name__)
+
+    def _apply_active_timeout(self):
+        try:
+            import datasync.data_sync as ds
+            seconds = ds.set_active_stale_s(
+                float(self.timeout_var.get()) * 60.0, self.campaign)
+        except ValueError:
+            self._flash("enter positive minutes")
+        except Exception as exc:
+            self._flash("save failed: %s" % type(exc).__name__)
+        else:
+            self.timeout_var.set("%g" % (seconds / 60.0))
+            self._flash("saved")
 
     def _start(self):
         """Start the daemon, REPLACING any existing one.
@@ -885,6 +915,15 @@ class MirrorWidget(tk.Tk):
         self.title_lbl.configure(text="backup · %s" % _STATE_WORDS.get(s["state"], s["state"]))
         self.camp_lbl.configure(
             text=(s["campaign"] or s.get("error") or "no campaign"))
+
+        self.timeout_entry.configure(
+            state="disabled" if s["state"] == "no campaign" else "normal")
+        timeout = s["active_stale_s"]
+        if (self._timeout_campaign != s["campaign"]
+                or self._timeout_saved_s != timeout):
+            self.timeout_var.set("" if timeout is None else "%g" % (timeout / 60.0))
+            self._timeout_campaign = s["campaign"]
+            self._timeout_saved_s = timeout
 
         if s["state"] == "no campaign":
             self.rows["state"].configure(

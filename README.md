@@ -84,6 +84,25 @@ python -m datasync.data_sync_ui
 The installed console scripts `datasync-sync` and `datasync-verify` are aliases
 for `python -m datasync.data_sync` / `datasync.data_verify`.
 
+## Active-run hold time
+
+In the backup widget, set **Hold after last write (min)** and press **Apply**
+(or Enter). The default is 15 minutes. Any positive, finite value is accepted,
+including fractional minutes. Shorter holds allow copying sooner.
+
+The timeout measures time since the experiment last refreshed its protection
+marker, rather than the data file's modification time. It is saved per campaign
+in the campaign data root's `_sync/settings.json` as `active_stale_s` (seconds).
+The copier and widget countdown read the same setting. It persists across
+restarts and affects existing markers at their next evaluation; a copy already
+in progress keeps its existing exclusions. Explicit release or supersession by
+a later sibling run can still release a marker earlier.
+
+Reducing the timeout can immediately expire older markers at the next check.
+Increasing it cannot restore markers already expired. When upgrading from a
+version without this setting, reopen the widget and press **start** once to
+restart the daemon with the updated code. Later timeout edits need no restart.
+
 ## Layout / domain model
 
 `data_paths` encodes a specific on-disk layout: campaigns under the data root,
